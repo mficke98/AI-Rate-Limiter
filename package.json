@@ -1,0 +1,14 @@
+{
+  "name": "ai-rate-limiter",
+  "version": "0.1.0",
+  "description": "Real-time AI rate limiter and fallback proxy for an LLM gateway",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/",
+    "smoke": "node tests/smoke.js"
+  },
+  "engines": { "node": ">=20.0.0" },
+  "license": "MIT"
+}
