@@ -235,3 +235,108 @@ final documentation so a non-technical reader seeing it for the first time can u
 
 **Claude's response:** added this appendix so the dialogue is preserved rather than only the
 outcomes, and committed to writing `REPORT.md` in plain language for a non-technical reader.
+
+---
+
+## D11 — Three-state circuit breaker (CLOSED / OPEN / HALF_OPEN)
+**Status:** ACCEPTED · **Sprint:** 2
+
+**Context.** The brief names two states, `CLOSED` and `OPEN`. A two-state breaker has no defined way to recover: something must eventually retry the primary to discover it is healthy again.
+
+**Decision.** Implement the standard three-state breaker. `HALF_OPEN` is an internal probing state entered automatically once the cooldown elapses.
+
+**Benefits.**
+- Recovery is automatic and requires no operator intervention or restart.
+- Only a small number of probe requests are exposed to a still-unhealthy primary, instead of the full traffic flow being dumped back onto it the instant the cooldown ends.
+- Requiring `successThreshold` consecutive successes prevents a single lucky response from prematurely declaring recovery and causing the breaker to flap.
+- Still satisfies the brief exactly: `/api/metrics` reports `CLOSED` and `OPEN` as required, with `HALF_OPEN` as extra fidelity.
+
+**Trade-offs.**
+- A third state to reason about, document, and test.
+- A small number of probe requests will be slower than a fallback would have been, since they pay the primary's timeout before failing over. This is the price of ever recovering at all.
+
+---
+
+## D12 — Count consecutive failures, not a failure ratio
+**Status:** ACCEPTED · **Sprint:** 2
+
+**Context.** Breakers commonly trip on either N consecutive failures or a failure percentage over a rolling window.
+
+**Decision.** Trip on `failureThreshold` consecutive failures; any success resets the counter to zero.
+
+**Benefits.**
+- Trivial to reason about and to demonstrate: three failures in a row trips it, full stop.
+- Immune to a low-traffic distortion that ratio-based breakers suffer, where one failure out of two requests reads as a catastrophic 50% error rate.
+- Intermittent, unrelated failures cannot accumulate into a trip — there is an explicit test asserting this.
+
+**Trade-offs.**
+- A primary that fails 50% of the time in an alternating pattern would never trip the breaker, despite being badly degraded.
+- **Production path:** a rolling error-rate window with a minimum-sample floor. Overkill for a prototype whose demo needs deterministic, explainable behaviour.
+
+---
+
+## D13 — Timeouts and errors are treated identically by the breaker
+**Status:** ACCEPTED · **Sprint:** 2
+
+**Context.** The brief distinguishes "returns an error" from "latency spikes". They could be counted separately.
+
+**Decision.** Both increment the same failure counter. `ModelTimeoutError` and `ModelFailureError` are distinct classes for *reporting*, but the breaker treats them as one thing.
+
+**Benefits.**
+- From the client's perspective a hung model and a broken model are the same problem: no usable answer arrives. Routing should respond to the symptom, not the cause.
+- One counter means one threshold to tune, rather than two interacting ones.
+- The metrics endpoint still reports timeouts separately, so the distinction is preserved where it actually matters — diagnosis.
+
+**Trade-offs.**
+- Cannot apply a different tripping policy to slowness than to hard errors, which a mature gateway might want.
+
+---
+
+## D14 — `snapshot()` is side-effect free; `allowsPrimary()` is not
+**Status:** ACCEPTED · **Sprint:** 2
+
+**Context.** An OPEN breaker past its cooldown must move to HALF_OPEN. Something has to trigger that, and cooldown expiry is driven by time rather than by any event.
+
+**Decision.** The transition happens inside `allowsPrimary()`, which is only called on the request path. `snapshot()`, which backs the metrics endpoint, never mutates state.
+
+**Benefits.**
+- Polling `GET /api/metrics` can never alter proxy behaviour. A monitoring dashboard refreshing every second would otherwise silently consume the probe opportunity — a genuinely nasty class of bug.
+- Metrics report what the breaker will actually do for the next real request.
+- Avoids a background timer, keeping the whole system driven purely by request flow.
+
+**Trade-offs.**
+- Metrics may briefly show `OPEN` for a breaker whose cooldown has technically expired, until a real request arrives to probe it. `cooldownRemainingMs: 0` makes this visible, and a covering test documents the behaviour as intentional.
+
+---
+
+## D15 — Metrics store holds no routing logic
+**Status:** ACCEPTED · **Sprint:** 2
+
+**Context.** The metrics endpoint reports fallback counts and breaker state, which it could plausibly derive itself.
+
+**Decision.** `MetricsStore` is a dumb counter bag. It records what the route tells it and computes only simple aggregates (rates, averages).
+
+**Benefits.**
+- Metrics can never disagree with behaviour, because they hold no second copy of the routing rules to drift out of sync.
+- Every counter is trivially unit-testable in isolation.
+- Adding a new metric never risks changing how requests are routed.
+
+**Trade-offs.**
+- The route must remember to record each outcome; a missing call means a silently wrong metric. Mitigated by end-to-end route tests that assert counters actually move.
+
+---
+
+## D16 — Fallbacks are counted by cause
+**Status:** ACCEPTED · **Sprint:** 2
+
+**Context.** The brief asks only for a fallback count. Under D2 a fallback can occur for five different reasons.
+
+**Decision.** Report the total *and* a per-cause breakdown: soft request limit, soft token limit, primary error, primary timeout, circuit open.
+
+**Benefits.**
+- A bare count is ambiguous — "40 fallbacks" could mean the primary is broken or simply that traffic is over budget, which demand completely different responses.
+- Makes the metrics endpoint self-explaining during a demo: the numbers narrate what happened.
+- Costs one extra object of integer counters.
+
+**Trade-offs.**
+- A slightly larger response payload and one more thing to keep in sync as causes are added.
