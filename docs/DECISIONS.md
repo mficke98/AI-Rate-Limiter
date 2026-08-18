@@ -340,3 +340,126 @@ outcomes, and committed to writing `REPORT.md` in plain language for a non-techn
 
 **Trade-offs.**
 - A slightly larger response payload and one more thing to keep in sync as causes are added.
+
+---
+
+## D17 — A composition root builds all collaborators
+**Status:** ACCEPTED · **Sprint:** 3
+
+**Context.** The limiter, breaker, models, and metrics store all need to be constructed and wired together. They could each construct their own dependencies, or a single factory could do it.
+
+**Decision.** `src/app.js` exposes `createApp(overrides)`, which builds one fully wired set of collaborators. Nothing below it constructs its own dependencies.
+
+**Benefits.**
+- A test can spin up a complete, isolated proxy with millisecond windows and a hair-trigger breaker without touching production defaults — this is what makes the 102-test suite run in about two seconds.
+- Tests are fully isolated from one another: each gets its own limiter and breaker, so no test can leak state into the next.
+- Swapping the simulated models for real HTTP clients is a change to one file.
+
+**Trade-offs.**
+- One more layer of indirection to follow when reading the code.
+- Dependencies are passed as a single `deps` object rather than named parameters, which is slightly looser typing than ideal in plain JavaScript.
+
+---
+
+## D18 — Two endpoints beyond the brief: health and metrics reset
+**Status:** ACCEPTED · **Sprint:** 3
+
+**Context.** The brief specifies `POST /api/generate` and `GET /api/metrics` only.
+
+**Decision.** Add `GET /api/health` and `POST /api/metrics/reset`.
+
+**Benefits.**
+- A demo that cannot be reset is a demo you get exactly one shot at. Once the hard limit is hit, every subsequent request returns 429 for a full minute — reset makes the system demonstrable repeatedly, and the demo script depends on it.
+- `/api/health` is the conventional liveness probe any real deployment target expects, and it costs three lines.
+- Reset is a separate route from the metrics read, so polling can never clear the counters by accident.
+
+**Trade-offs.**
+- Reset is unauthenticated. Acceptable for a local prototype; in production it would need to be an admin-scoped route or removed entirely.
+- Two endpoints beyond the specification, which is scope the brief did not ask for.
+
+---
+
+## D19 — Validation happens before any counter moves
+**Status:** ACCEPTED · **Sprint:** 3
+
+**Context.** A request with a missing or malformed prompt could be counted against the budget or ignored by it.
+
+**Decision.** Requests failing validation return 400 before `metrics.recordRequest()` or any limiter interaction.
+
+**Benefits.**
+- A client's own malformed request cannot exhaust the budget that its well-formed requests depend on.
+- Metrics report real traffic rather than a mix of traffic and client bugs.
+- A covering test asserts that five invalid requests leave the window completely untouched.
+
+**Trade-offs.**
+- A client spamming malformed requests is not rate-limited by this proxy at all. Mitigated in part by the 1 MB body cap; in production this belongs to an edge WAF rather than an application-level breaker.
+
+---
+
+## D20 — A rejected request is not recorded against the window
+**Status:** ACCEPTED · **Sprint:** 3
+
+**Context.** When a request is shed with a 429, it could either be recorded (counting the attempt) or ignored.
+
+**Decision.** Shed requests never enter the sliding window. Only requests that actually reached a model are recorded.
+
+**Benefits.**
+- A client that retries aggressively while throttled cannot dig itself deeper into a hole it can never climb out of.
+- `Retry-After` stays accurate: it is computed from real served requests, so waiting the advertised time genuinely frees capacity.
+- Metrics separate `rejected` from `servedByFallback`, so throttling and degradation never look like the same event.
+
+**Trade-offs.**
+- The proxy does no accounting for abusive traffic — a client hammering it while throttled costs CPU that no counter reflects. Visible via `requests.rejected`, but not acted upon.
+
+---
+
+## D21 — The HTTP layer holds no business logic
+**Status:** ACCEPTED · **Sprint:** 3
+
+**Context.** With no framework (D1), routing and parsing are hand-written and could easily accumulate logic.
+
+**Decision.** `src/server.js` only parses, routes, serialises, and catches transport errors. Route handlers are pure functions of `(deps, body)` returning `{status, headers, body}`.
+
+**Benefits.**
+- Handlers can be tested as plain function calls *and* over a real socket, and the tests exercise the same code path either way.
+- Replacing the transport (Express, Fastify, a serverless handler) touches exactly one file.
+- A top-level catch guarantees a handler bug returns a 500 rather than taking the process down — which matters especially in a component whose entire purpose is keeping traffic flowing when things break.
+
+**Trade-offs.**
+- Handlers build a response object instead of writing to the socket, so streaming responses would need a different shape. Not a constraint for JSON, but it would matter if the proxy ever streamed tokens.
+
+---
+
+## D22 — End-to-end tests run against a real socket
+**Status:** ACCEPTED · **Sprint:** 3
+
+**Context.** Route tests could call the handler functions directly, which is faster, or go over real HTTP.
+
+**Decision.** `tests/routes.test.js` starts a real server on an ephemeral port (`listen(0)`) and uses `fetch`.
+
+**Benefits.**
+- Actually verifies the headers the brief grades on. `X-Fallback-Applied` and `Retry-After` are only real once they have survived serialisation onto a socket.
+- Catches wiring bugs that direct handler calls cannot see: JSON parsing, content types, method routing.
+- Port 0 means the suite never collides with a developer's already-running server.
+
+**Trade-offs.**
+- Roughly two seconds of suite runtime rather than milliseconds.
+- Two tests use a real `setTimeout` to wait out the breaker cooldown, so they are the only wall-clock-dependent tests in the suite. The cooldown is set to 200 ms in test config to keep this cheap.
+
+---
+
+## D23 — Windows entry-point guard uses `pathToFileURL`
+**Status:** ACCEPTED · **Sprint:** 3 · *(bug found and fixed during the sprint)*
+
+**Context.** `server.js` must start a listener when run directly but not when imported by a test. The idiomatic check compares `import.meta.url` against `process.argv[1]`.
+
+**Bug found.** The initial string comparison failed silently on Windows: this project's path contains spaces, which `import.meta.url` percent-encodes (`%20`) while `process.argv[1]` does not. `node src/server.js` started no listener and exited without error — caught immediately because the first live curl returned nothing.
+
+**Decision.** Compare `import.meta.url` against `pathToFileURL(process.argv[1]).href`, which normalises both sides.
+
+**Benefits.**
+- Correct on Windows, macOS, and Linux regardless of spaces or path separators.
+- Fails loudly rather than silently if it ever breaks again, because the server simply will not start.
+
+**Trade-offs.**
+- One extra import. Recorded here because the failure mode — a silent no-op with a zero exit code — is worth documenting for anyone who hits it again.
