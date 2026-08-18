@@ -124,3 +124,114 @@ Newest entries are appended at the bottom. Format is lightweight ADR.
 **Trade-offs.** If time runs out the demo is curl plus the smoke script, and the requested front-end unit tests have no subject.
 
 **If built.** React delivered via CDN in a single static file, preserving the zero-install, zero-build property of D1 rather than introducing a bundler.
+
+---
+
+## D7 — State is in-memory and per-process
+**Status:** ACCEPTED · **Sprint:** 1
+
+**Context.** The limiter, breaker, and metrics all need mutable state. Options were in-memory, a local file, or Redis.
+
+**Decision.** Plain in-memory data structures, scoped to the single server process.
+
+**Benefits.**
+- Zero infrastructure to install or run, consistent with D1.
+- Microsecond reads and writes, so the proxy adds negligible latency to the very path it exists to protect.
+- The brief explicitly calls for a *local* proxy, which this satisfies exactly.
+
+**Trade-offs.**
+- All counters reset on restart — acceptable for rate limiting, less so for long-run metrics.
+- Does not survive horizontal scaling: two proxy instances would each enforce their own separate budget, so the effective global limit would be double the configured one.
+- **Production path:** swap the limiter's storage for a Redis sorted set keyed by client ID. The interface was designed so this is a single-file change.
+
+---
+
+## D8 — Sliding window rather than fixed window
+**Status:** ACCEPTED · **Sprint:** 1
+
+**Context.** The brief asks for a "sliding token limit". The cheaper alternative is a fixed window that resets on a clock boundary.
+
+**Decision.** A trailing window: every request is timestamped, and only events within the last `windowMs` count toward the budget.
+
+**Benefits.**
+- Eliminates the boundary burst. Under a fixed window a client can spend the full budget at 11:59:59 and the full budget again at 12:00:00 — twice the intended rate. A regression test asserts this cannot happen.
+- Capacity returns smoothly and continuously rather than in a cliff-edge reset, which is a better experience for a client only slightly over budget.
+- Yields an accurate `Retry-After` value, computed from when the oldest entry actually expires.
+
+**Trade-offs.**
+- Stores one entry per request instead of a single integer counter. At the volumes this proxy targets the cost is irrelevant; at very high throughput it would need a ring buffer or a Redis sorted set.
+- Pruning runs on every read, making reads O(expired) rather than O(1). A bounded-memory regression test guards against unbounded growth.
+
+---
+
+## D9 — Injected clock instead of real time in state machines
+**Status:** ACCEPTED · **Sprint:** 1
+
+**Context.** Both the limiter and the breaker are time-dependent. Testing them against the real clock requires sleeping, which is slow and flaky.
+
+**Decision.** Both accept a `now()` function, defaulting to `Date.now`. Tests pass a controllable counter.
+
+**Benefits.**
+- Window expiry and breaker cooldown are tested deterministically and instantly — the full suite runs in well under a second.
+- Scenarios that would take minutes in real time are exercised in microseconds.
+- No arbitrary sleep values, so the suite cannot flake on a loaded machine.
+
+**Trade-offs.**
+- A small amount of extra ceremony in the constructor signature.
+- Tests exercise logical time, not wall-clock behaviour, so the end-to-end smoke script remains necessary to prove the real-time path works.
+
+---
+
+## D10 — Separate `check()` from `record()` in the limiter
+**Status:** ACCEPTED · **Sprint:** 1
+
+**Context.** The routing decision must be made *before* a model is called, but the true token cost is only known *after* it responds.
+
+**Decision.** `check(estimatedTokens)` returns a verdict without mutating state; `record(actualTokens)` commits real consumption afterwards.
+
+**Benefits.**
+- Recorded usage reflects actual tokens consumed rather than a pre-flight guess, so the metrics endpoint reports the truth.
+- A rejected request never pollutes the window, so a throttled client is not punished twice.
+- The verdict is a pure function of current state, which makes it trivial to test.
+
+**Trade-offs.**
+- Two calls per request instead of one; forgetting the `record` call would silently disable limiting. Mitigated by end-to-end route tests that assert usage actually accumulates.
+- A theoretical race window between check and record. Irrelevant in Node's single-threaded event loop, but it would need attention in a multi-threaded port.
+
+---
+
+# Appendix A — Conversation record
+
+Verbatim record of the decision points raised with the stakeholder, the options presented, and the
+direction given. Preserved so the reasoning behind each choice is auditable, not just its outcome.
+
+### Exchange 1 — Sprint 0 kickoff
+
+**Claude asked** four questions, each with options plus benefits and trade-offs: runtime stack
+(zero-dep Node vs Express vs FastAPI), rate-limit policy (fallback vs 429 vs two-tier), git
+workflow (local merge vs direct-to-main vs GitHub PR), and testing depth (unit+smoke vs smoke only
+vs manual curl).
+
+**Stakeholder answered:**
+1. *Stack* — restated the trade-off ("fastest prototype with limited setup and no NPM install... the trade off is that we have to write more manual code") and chose zero-dependency Node.
+2. *Limit policy* — described the intended sequence: circuit breaker trips, primary returns a timeout, fall back to secondary with the header set; if that also fails, catch the error gracefully and report a 429. Asked which option best fits and why.
+3. *Git flow* — "Check out from main every time. Each PR needs to belong to its own branch, and then we're going to push to remote, and then we're going to merge that PR into main, and then we're going to update main, and we're going to repeat the process iteratively."
+4. *Testing* — required "robust and comprehensive unit testing" as "proof of evidence that what we are doing works and the code integrity is there."
+
+**Claude responded** with one correction and one gap:
+- *Correction:* `429 Too Many Requests` belongs to the rate limiter, not to the both-backends-failed case. Using it there instructs the client to slow down when the real fault is backend unavailability, and standard retry libraries would then apply the wrong strategy. `503 Service Unavailable` is the correct signal. Recorded as D2.
+- *Gap:* the stakeholder asked for front-end unit tests, but the brief specifies two JSON endpoints and no UI — so no front end existed to test. Flagged rather than silently assumed either way.
+- *Minor note:* in-memory state follows from this being a single-process prototype, not from the zero-dependency choice. Recorded as D7.
+
+**Stakeholder confirmed** the two-tier policy with a 503 last resort, and deferred the front-end
+decision: "Ask me when we get to that point in the project if we should have a front end depending
+on how much time we have left... presumably in React." Recorded as D6.
+
+### Exchange 2 — Mid-sprint direction
+
+**Stakeholder instructed:** keep documentation updated in parallel with the code; catalogue every
+decision with its rationale, benefits, trade-offs, and the dialogue on both sides; and write the
+final documentation so a non-technical reader seeing it for the first time can understand it.
+
+**Claude's response:** added this appendix so the dialogue is preserved rather than only the
+outcomes, and committed to writing `REPORT.md` in plain language for a non-technical reader.
