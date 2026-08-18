@@ -463,3 +463,24 @@ outcomes, and committed to writing `REPORT.md` in plain language for a non-techn
 
 **Trade-offs.**
 - One extra import. Recorded here because the failure mode — a silent no-op with a zero exit code — is worth documenting for anyone who hits it again.
+
+---
+
+## D24 — Front end dropped; documentation prioritised
+**Status:** ACCEPTED · **Sprint:** 4 · *(supersedes the deferral in D6)*
+
+**Context.** D6 deferred the front-end decision until the backend was complete. At that point the stakeholder chose "docs + React dashboard", then flagged that eight minutes remained and asked for an honest assessment.
+
+**Decision.** Drop the dashboard. Finish `README.md` and `REPORT.md` and merge them.
+
+**Claude's assessment, given verbatim:** building the dashboard, testing it, and landing two pull requests in the remaining time would realistically mean shipping the UI thin or unmerged, while risking the two deliverables the stakeholder had named explicitly.
+
+**Benefits.**
+- Everything explicitly requested is delivered and merged rather than left partially done.
+- The decision log and plain-language report are the highest-value artifacts for a reviewer, and both are complete.
+- Avoids leaving untested UI code in the repository, which would weaken rather than strengthen the integrity claim.
+
+**Trade-offs.**
+- No visual demonstration; the demo remains `scripts/demo.js` in the terminal.
+- The requested front-end unit tests have no subject, so test coverage is backend-only.
+- **If resumed:** a single-file React dashboard delivered via CDN, polling `/api/metrics`, preserving the zero-install property of D1.
